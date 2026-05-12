@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>awake</title>
+  <link rel="stylesheet" href="css/styles.css">
+  
+  <script src="https://unpkg.com/@lottiefiles/lottie-player@latest/dist/lottie-player.js"></script>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="app-shell">
+    
+    <div id="splash-screen">
+      <lottie-player 
+        id="splash-lottie" 
+        class="splash-animation" 
+        src="animation/awake_animation.json" 
+        background="transparent" 
+        speed="1" 
+        autoplay>
+      </lottie-player>
+    </div>
+
+    <header class="app-header" id="app-header">
+      <div class="logo" id="logo-btn">
+        <img src="icons/awake_word_mark.svg" id="logo-img" alt="awake" height="18">
+      </div>
+      <div class="header-actions">
+        <div class="header-btn-wrapper">
+          <button id="fab-insights-btn" class="settings-btn" style="display: flex;">
+            <img src="icons/body_insights_icon_green.svg" id="fab-insights-icon" alt="Insights" width="120" height="80">
+          </button>
+          <button class="settings-btn open-settings" id="header-settings-btn" style="display: none;">
+            <img src="icons/setting_icon.svg" id="settings-btn-icon" alt="Settings" width="24" height="24">
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main class="content no-scrollbar">
+      <div class="screen-slider" id="screen-slider">
+        
+        <div id="home-screen" class="screen">
+          
+          <div class="hero-section">
+            
+            <div class="caffeine-display">
+              <div class="caffeine-text-left">
+                <h1 id="drink-name">Espresso</h1>
+              </div>
+              <div class="mg-row">
+                <span id="caffeine-mg" class="mg-value">65</span>
+                <span class="mg-label">mg</span>
+              </div>
+            </div>
+
+            <div id="canvas-container" class="canvas-container">
+              <div id="swipe-zone" class="swipe-zone"></div>
+            </div>
+
+            <div class="carousel-dots" id="carousel-dots"></div>
+
+            <div class="action-row">
+              <div id="modifier-container">
+                <div id="modifier-toggle" class="modifier-toggle"></div>
+                <div id="modifier-tooltip" class="black-tooltip hidden">
+                  <span>S is for single shot or small drink,<br>D is for a double shot<br>and L for a large drink</span>
+                  <button id="close-tooltip" class="close-tooltip-btn">&times;</button>
+                </div>
+              </div>
+              
+              <button id="add-btn" class="add-button">+ Add</button>
+            </div>
+
+          </div>
+
+          <div class="cards-container">
+            <div class="card-row three-cols">
+              <div class="physio-card third-width">
+                <div class="card-text">
+                  <span class="card-label">Peak</span>
+                  <span class="card-value" id="peak-time">—</span>
+                </div>
+              </div>
+              <div class="physio-card third-width">
+                <div class="card-text">
+                  <span class="card-label">Half-life</span>
+                  <span class="card-value" id="halflife-time">—</span>
+                </div>
+              </div>
+              <div class="physio-card third-width">
+                <div class="card-text">
+                  <span class="card-label">Sleep</span>
+                  <span class="card-value" id="sleep-time">—</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="insights-screen" class="screen">
+          <div class="cards-container">
+            
+            <div class="blood-display full-width text-center">
+              <span class="blood-label">Caffeine in blood</span>
+              <div class="mg-row" style="justify-content: center;">
+                <span id="current-blood-mg" class="mg-value">0</span>
+                <span class="mg-label">mg</span>
+              </div>
+            </div>
+
+            <div class="graph-card full-width mt-3">
+              <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+                <span class="card-label">Daily curve</span>
+                <span id="current-phase-tag" class="phase-tag">Relax Phase</span>
+              </div>
+              
+              <canvas id="caffeine-graph" width="400" height="150"></canvas>
+              <div class="graph-labels">
+                <span>6 AM</span>
+                <span>12 PM</span>
+                <span>6 PM</span>
+                <span>12 AM</span>
+              </div>
+            </div>
+
+            <div id="card-peak" class="physio-card full-width mt-3">
+              <div class="card-text">
+                <span class="card-label">Peak effect</span>
+                <span class="card-value" id="insight-peak-time">—</span>
+              </div>
+              <span class="icon">
+                <img id="insight-peak-icon" src="icons/flash_icon.svg" alt="Peak" width="24" height="24">
+              </span>
+            </div>
+            
+            <div id="card-halflife" class="physio-card full-width">
+              <div class="card-text">
+                <span class="card-label">Half-life</span>
+                <span class="card-value" id="insight-halflife-time">—</span>
+              </div>
+              <span class="icon">
+                <img id="insight-half-icon" src="icons/clock_icon.svg" alt="Half-life" width="18" height="18">
+              </span>
+            </div>
+
+            <div id="card-sleep" class="physio-card full-width">
+              <div class="card-text">
+                <span class="card-label">Sleep safe</span>
+                <span class="card-value" id="insight-sleep-time">—</span>
+              </div>
+              <span class="icon">
+                <img id="insight-sleep-icon" src="icons/moon_icon.svg" alt="Sleep safe" width="18" height="18">
+              </span>
+            </div>
+          </div>
+          
+          <div class="log-card">
+            <h2 class="log-title">Today's Log</h2>
+            <div id="log-list" class="log-list"></div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <div id="undo-toast" class="toast hidden">
+      <span>Drink removed</span>
+      <button id="undo-btn">Undo</button>
+    </div>
+
+    <div id="profile-toast" class="toast hidden">
+      <span id="profile-toast-msg">Profile changed</span>
+    </div>
+
+    <div id="settings-overlay" class="modal-overlay hidden"></div>
+    <div id="settings-sheet" class="modal-sheet hidden">
+      <div class="modal-header">
+        <h2>Settings</h2>
+        <button id="close-settings" class="close-btn">Done</button>
+      </div>
+      
+      <div class="modal-content">
+        <div class="settings-section">
+          <h3>Metabolism Profile</h3>
+          <div class="segmented-control" id="profile-selector">
+            <input type="radio" name="profile" id="prof-smoker" value="smoker">
+            <label for="prof-smoker">Smoker</label>
+            <input type="radio" name="profile" id="prof-neutral" value="neutral" checked>
+            <label for="prof-neutral">Neutral</label>
+            <input type="radio" name="profile" id="prof-pregnant" value="pregnant">
+            <label for="prof-pregnant">Pill/Preg.</label>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Tolerance</h3>
+          <div class="segmented-control" id="habit-selector">
+            <input type="radio" name="habit" id="habit-unregular" value="unregular" checked>
+            <label for="habit-unregular">Occasional</label>
+            <input type="radio" name="habit" id="habit-regular" value="regular">
+            <label for="habit-regular">Regular</label>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Drink order</h3>
+          <ul id="sortable-drinks" class="sortable-list"></ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
