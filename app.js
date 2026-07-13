@@ -2,19 +2,6 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 
-// --- CUSTOM SHADERS ---
-import { espressoCupMaterial, applyEspressoShaders } from './shaders/espressoShader.js'; 
-import { cappuccinoCupMaterial, createCappuccinoFoamMaterial } from './shaders/cappuccinoShader.js';
-
-import { cupMaterial as americanoCup, liquidMaterial as americanoLiquid } from './shaders/americanoShader.js';
-import { cupMaterial as filterCup, liquidMaterial as filterLiquid } from './shaders/filtered_coffeeShader.js';
-import { glassMaterial as latteGlass, liquidMaterial as latteLiquid } from './shaders/latte_macchiatoShader.js';
-import { cupMaterial as matchaCup } from './shaders/matcha_cupShader.js';
-import { liquidMaterial as matchaLiquid } from './shaders/matcha_liquidShader.js';
-import { cupMaterial as mateCup, strawMaterial as mateStraw, liquidMaterial as mateLiquid } from './shaders/mateShader.js';
-import { glassMaterial as teaGlass, liquidMaterial as teaLiquid } from './shaders/tea_blackShader.js';
-import { cafeCremaCupMaterial, applyCafeCremaShaders } from './shaders/cafe_cremaShader.js';
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Splash screen
 // ─────────────────────────────────────────────────────────────────────────────
@@ -22,6 +9,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const splash       = document.getElementById('splash-screen');
   const homeScreen   = document.getElementById('home-screen');
   const splashLottie = document.getElementById('splash-lottie');
+  const splashDurationMs = 2667;
   let splashHidden   = false;
 
   const hideSplash = () => {
@@ -37,9 +25,9 @@ document.addEventListener('DOMContentLoaded', () => {
       console.warn('Lottie animation failed to load. Skipping splash screen.');
       hideSplash();
     });
-    setTimeout(hideSplash, 4000);
+    setTimeout(hideSplash, splashDurationMs);
   } else {
-    setTimeout(hideSplash, 2800);
+    setTimeout(hideSplash, splashDurationMs);
   }
 });
 
@@ -62,27 +50,39 @@ const DRINKS = [
 const savedOrder = JSON.parse(localStorage.getItem('caffeine-order')) || DRINKS.map(d => d.id);
 const initialDrink = DRINKS.find(d => d.id === savedOrder[0]) || DRINKS[0];
 const initialModifier = initialDrink.variants && initialDrink.variants.length > 0 ? initialDrink.variants[0].modifier : null;
+const DEFAULT_BEDTIME_MINUTES = 22 * 60;
+const savedBedtimeMinutes = Number.parseInt(localStorage.getItem('awake-bedtime-minutes'), 10);
+const initialBedtimeMinutes = Number.isFinite(savedBedtimeMinutes)
+  ? ((savedBedtimeMinutes % 1440) + 1440) % 1440
+  : DEFAULT_BEDTIME_MINUTES;
 
 let state = {
   selectedDrinkId:  initialDrink.id,
   selectedModifier: initialModifier,
   log:        JSON.parse(localStorage.getItem('caffeine-log'))   || [],
   profile:    localStorage.getItem('caffeine-profile')           || 'neutral',
-  habit:      localStorage.getItem('caffeine-habit')             || 'unregular',
+  habit:      localStorage.getItem('caffeine-habit')             || 'regular',
+  bedtimeMinutes: initialBedtimeMinutes,
   drinkOrder: savedOrder,
 };
 
-let predictionFreezeTime = 0;
 let deletedDrinkMemory   = null;
 let undoTimeout          = null;
 let profileToastTimeout  = null;
+let bedtimeInputTimeout  = null;
 let scrubX               = null;
+let graphTooltip         = null;
 let prevBloodMg          = null;
+let graphWindowStartMs   = null;
+let graphPanStartX       = 0;
+let graphPanStartMs      = 0;
+let graphIsPanning       = false;
 
 function saveState() {
   localStorage.setItem('caffeine-log',     JSON.stringify(state.log));
   localStorage.setItem('caffeine-profile', state.profile);
   localStorage.setItem('caffeine-habit',   state.habit);
+  localStorage.setItem('awake-bedtime-minutes', String(state.bedtimeMinutes));
   localStorage.setItem('caffeine-order',   JSON.stringify(state.drinkOrder));
   updateUI();
 }
@@ -104,6 +104,136 @@ function getHalfLifeMs() {
 function getSleepSafeThreshold() { return state.habit === 'regular' ? 45 : 25; }
 
 const PEAK_EFFECT_MINS = 45;
+const SLEEP_CYCLE_MS = 90 * 60000;
+const GRAPH_WINDOW_MS = 6 * 3600000;
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function getTodayLogs(logArray = state.log) {
+  return logArray.filter(e => new Date(e.time).toDateString() === new Date().toDateString());
+}
+
+function minutesToTimeValue(minutes) {
+  const normalized = ((minutes % 1440) + 1440) % 1440;
+  const h = Math.floor(normalized / 60).toString().padStart(2, '0');
+  const m = (normalized % 60).toString().padStart(2, '0');
+  return `${h}:${m}`;
+}
+
+function parseTimeValue(value) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value || '');
+  if (!match) return DEFAULT_BEDTIME_MINUTES;
+  const hours = clamp(Number.parseInt(match[1], 10), 0, 23);
+  const minutes = clamp(Number.parseInt(match[2], 10), 0, 59);
+  return hours * 60 + minutes;
+}
+
+function getTargetBedtimeMs(referenceMs = Date.now()) {
+  const d = new Date(referenceMs);
+  const bedtimeHour = Math.floor(state.bedtimeMinutes / 60);
+  const bedtimeMinute = state.bedtimeMinutes % 60;
+  d.setHours(bedtimeHour, bedtimeMinute, 0, 0);
+  if (referenceMs > d.getTime() + (2 * 3600000)) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
+function getDefaultGraphStartMs(referenceMs = Date.now()) {
+  return referenceMs - (GRAPH_WINDOW_MS / 2);
+}
+
+function formatAxisOrientation(timestampMs) {
+  const hour = new Date(timestampMs).getHours();
+  const displayHour = hour % 12 || 12;
+  const ampm = hour >= 12 ? 'PM' : 'AM';
+  return `${displayHour} ${ampm}`;
+}
+
+function getSleepWindowLogs(logArray, bedtimeMs) {
+  const windowStart = bedtimeMs - (24 * 3600000);
+  const windowEnd = bedtimeMs + (6 * 3600000);
+  return logArray.filter(entry => entry.time >= windowStart && entry.time <= windowEnd);
+}
+
+function getSleepReadyTime(logArray, fromTimeMs = Date.now(), bedtimeMs = getTargetBedtimeMs(fromTimeMs)) {
+  return findFixedDecayTime(getSleepWindowLogs(logArray, bedtimeMs), getSleepSafeThreshold(), fromTimeMs);
+}
+
+function getImpactLabel(value) {
+  if (value < 0.18) return 'Low';
+  if (value < 0.42) return 'Light';
+  if (value < 0.78) return 'Moderate';
+  return 'High';
+}
+
+function getSleepForecast(additionalMg = 0) {
+  const now = Date.now();
+  const bedtimeMs = getTargetBedtimeMs(now);
+  const hypotheticalLog = additionalMg > 0
+    ? [...state.log, { time: now, mg: additionalMg }]
+    : [...state.log];
+  const todayLogs = getSleepWindowLogs(hypotheticalLog, bedtimeMs);
+  const threshold = getSleepSafeThreshold();
+  const bedtimeMg = getTotalDecayedCaffeine(todayLogs, bedtimeMs);
+  const sleepReadyTime = getSleepReadyTime(hypotheticalLog, now, bedtimeMs);
+  const lastLog = todayLogs.length
+    ? todayLogs.reduce((latest, entry) => entry.time > latest.time ? entry : latest, { time: 0 })
+    : null;
+
+  const firstCycleSamples = [];
+  const secondCycleSamples = [];
+  for (let t = bedtimeMs; t <= bedtimeMs + (2 * SLEEP_CYCLE_MS); t += 15 * 60000) {
+    const mg = getTotalDecayedCaffeine(todayLogs, t);
+    if (t <= bedtimeMs + SLEEP_CYCLE_MS) firstCycleSamples.push(mg);
+    else secondCycleSamples.push(mg);
+  }
+
+  const avg = values => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+  const firstCycleAvg = avg(firstCycleSamples);
+  const secondCycleAvg = avg(secondCycleSamples);
+  const bedtimePenalty = clamp((bedtimeMg / Math.max(1, threshold)) * 18, 0, 34);
+  const overlapPenalty = clamp(((firstCycleAvg + secondCycleAvg) / Math.max(1, threshold)) * 9, 0, 26);
+  const hoursBeforeBed = lastLog ? (bedtimeMs - lastLog.time) / 3600000 : 99;
+  const lateDrinkPenalty = clamp((8 - hoursBeforeBed) * 2.3, 0, 18);
+  const readyDelayPenalty = sleepReadyTime && sleepReadyTime > bedtimeMs
+    ? clamp(((sleepReadyTime - bedtimeMs) / 3600000) * 7, 0, 22)
+    : 0;
+  const score = Math.round(clamp(100 - bedtimePenalty - overlapPenalty - lateDrinkPenalty - readyDelayPenalty, 0, 100));
+  const deepImpactRatio = firstCycleAvg / Math.max(1, threshold);
+  const remImpactRatio = secondCycleAvg / Math.max(1, threshold);
+
+  let summary = 'Tonight looks calm. Your caffeine curve fits well with sleep.';
+  if (score < 55) summary = 'Tonight may feel restless. Falling asleep and early deep sleep could both be affected.';
+  else if (score < 72) summary = 'Falling asleep may be okay, but your first deep sleep phase may be affected.';
+  else if (score < 86) summary = 'Good for falling asleep, slightly elevated for deep sleep.';
+
+  return {
+    score,
+    summary,
+    bedtimeMs,
+    bedtimeMg: Math.round(bedtimeMg),
+    sleepReadyTime,
+    deepImpact: getImpactLabel(deepImpactRatio),
+    remImpact: getImpactLabel(remImpactRatio),
+    deepImpactRatio,
+    remImpactRatio,
+  };
+}
+
+function getCaffeineStatus(currentMg) {
+  const threshold = getSleepSafeThreshold();
+  if (currentMg <= threshold) {
+    return { label: currentMg <= 5 ? 'Sleep ready' : 'Almost sleep ready', detail: 'Below your sleep threshold' };
+  }
+  if (currentMg <= threshold * 1.6) {
+    return { label: 'Winding down', detail: `${Math.ceil(currentMg - threshold)} mg until your sleep threshold` };
+  }
+  if (currentMg <= threshold * 4) {
+    return { label: 'Awake', detail: `${Math.ceil(currentMg - threshold)} mg until your sleep threshold` };
+  }
+  return { label: 'Focused', detail: `${Math.ceil(currentMg - threshold)} mg until your sleep threshold` };
+}
 
 function formatTime(timestampMs) {
   if (!timestampMs) return '—';
@@ -174,25 +304,23 @@ const els = {
   dots:             document.getElementById('carousel-dots'),
   name:             document.getElementById('drink-name'),
   mg:               document.getElementById('caffeine-mg'),
+  caffeineStatus:   document.getElementById('caffeine-status'),
+  thresholdDetail:  document.getElementById('caffeine-threshold-detail'),
   modContainer:     document.getElementById('modifier-container'),
   modToggle:        document.getElementById('modifier-toggle'),
   addBtn:           document.getElementById('add-btn'),
-  peakTime:         document.getElementById('peak-time'),
-  halfLifeTime:     document.getElementById('halflife-time'),
-  sleepTime:        document.getElementById('sleep-time'),
   bloodMg:          document.getElementById('current-blood-mg'),
-  insightPeak:      document.getElementById('insight-peak-time'),
-  insightHalf:      document.getElementById('insight-halflife-time'),
   insightSleep:     document.getElementById('insight-sleep-time'),
-  cardPeak:         document.getElementById('card-peak'),
-  cardHalf:         document.getElementById('card-halflife'),
-  cardSleep:        document.getElementById('card-sleep'),
-  insightPeakIcon:  document.getElementById('insight-peak-icon'),
-  insightHalfIcon:  document.getElementById('insight-half-icon'),
-  insightSleepIcon: document.getElementById('insight-sleep-icon'),
+  bedtimeCaffeine:  document.getElementById('bedtime-caffeine'),
+  deepSleepImpact:  document.getElementById('deep-sleep-impact'),
+  remSleepImpact:   document.getElementById('rem-sleep-impact'),
   phaseTag:         document.getElementById('current-phase-tag'),
   graphCanvas:      document.getElementById('caffeine-graph'),
+  graphLabels:      document.getElementById('graph-labels'),
   logList:          document.getElementById('log-list'),
+  logCard:          document.querySelector('.log-card'),
+  logAccordionBtn:  document.getElementById('log-accordion-btn'),
+  logAccordionIcon: document.getElementById('log-accordion-icon'),
   canvasContainer:  document.getElementById('canvas-container'),
   undoToast:        document.getElementById('undo-toast'),
   undoBtn:          document.getElementById('undo-btn'),
@@ -204,9 +332,17 @@ const els = {
   closeSettingsBtn: document.getElementById('close-settings'),
   profileSelector:  document.getElementById('profile-selector'),
   habitSelector:    document.getElementById('habit-selector'),
+  settingsBedtime:  document.getElementById('settings-bedtime'),
+  bedtimeOverlay:   document.getElementById('bedtime-overlay'),
+  bedtimeSheet:     document.getElementById('bedtime-sheet'),
+  firstBedtime:     document.getElementById('first-bedtime'),
+  firstProfileSelector: document.getElementById('first-profile-selector'),
+  firstHabitSelector:   document.getElementById('first-habit-selector'),
+  saveBedtimeBtn:   document.getElementById('save-bedtime'),
   sortableList:     document.getElementById('sortable-drinks'),
-  fabInsightsBtn:   document.getElementById('fab-insights-btn'),
-  fabInsightsIcon:  document.getElementById('fab-insights-icon'),
+  bottomNav:        document.querySelector('.bottom-nav'),
+  navLogBtn:        document.getElementById('nav-log-btn'),
+  navSleepBtn:      document.getElementById('nav-sleep-btn'),
 };
 
 function triggerFullAnimation() {
@@ -221,9 +357,25 @@ function triggerNumberAnimation() {
   els.mg.classList.add('fade-slide');
 }
 
+function fitDrinkName() {
+  if (!els.name) return;
+  const parent = els.name.parentElement;
+  if (!parent) return;
+  parent.style.removeProperty('--drink-title-fit-size');
+  const styles = getComputedStyle(parent);
+  const baseSize = parseFloat(styles.fontSize) || 32;
+  const minSize = 20;
+  const availableWidth = parent.clientWidth;
+  if (!availableWidth) return;
+  const ratio = availableWidth / Math.max(1, els.name.scrollWidth);
+  const fitSize = Math.max(minSize, Math.min(baseSize, Math.floor(baseSize * ratio)));
+  parent.style.setProperty('--drink-title-fit-size', `${fitSize}px`);
+}
+
 function selectDrink(index) {
   const orderedDrinks    = getOrderedDrinks();
   const drink            = orderedDrinks[index];
+  if (!drink) return;
   state.selectedDrinkId  = drink.id;
   state.selectedModifier = drink.variants[0].modifier;
   switch3DModel(drink.id);
@@ -256,7 +408,7 @@ function renderModifierToggle(drink) {
   drink.variants.forEach(variant => {
     const btn      = document.createElement('button');
     btn.className  = `mod-btn ${state.selectedModifier === variant.modifier ? 'active' : ''}`;
-    btn.textContent = variant.label.charAt(0);
+    btn.textContent = variant.label.toLowerCase();
     btn.onclick    = () => { state.selectedModifier = variant.modifier; triggerNumberAnimation(); updateUI(); };
     els.modToggle.appendChild(btn);
   });
@@ -265,6 +417,12 @@ function renderModifierToggle(drink) {
 let currentTab = 0;
 const slider  = document.getElementById('screen-slider');
 const screens = [document.getElementById('home-screen'), document.getElementById('insights-screen')];
+function updateBottomNav() {
+  const isHome = currentTab === 0;
+  els.navLogBtn?.classList.toggle('active', isHome);
+  els.navSleepBtn?.classList.toggle('active', !isHome);
+  els.bottomNav?.classList.toggle('sleep-active', !isHome);
+}
 
 function switchToTab(tabIndex) {
   currentTab = tabIndex;
@@ -274,14 +432,7 @@ function switchToTab(tabIndex) {
   void activeScreen.offsetWidth;
   activeScreen.classList.add('animate-content');
 
-  // Toggle Header Buttons based on Tab
-  if (tabIndex === 0) {
-    els.fabInsightsBtn.style.display = 'flex';
-    document.getElementById('header-settings-btn').style.display = 'none';
-  } else {
-    els.fabInsightsBtn.style.display = 'none';
-    document.getElementById('header-settings-btn').style.display = 'flex';
-  }
+  updateBottomNav();
   setTimeout(updateUI, 50);
 }
 
@@ -291,6 +442,7 @@ function switchToTab(tabIndex) {
 function initSettings() {
   els.settingsBtns.forEach(btn => {
     btn.onclick = () => {
+      if (els.settingsBedtime) els.settingsBedtime.value = minutesToTimeValue(state.bedtimeMinutes);
       els.settingsOverlay.classList.remove('hidden');
       els.settingsSheet.classList.remove('hidden');
       renderSortableList();
@@ -308,11 +460,12 @@ function initSettings() {
   if (activeProfileRadio) activeProfileRadio.checked = true;
   const activeHabitRadio = els.habitSelector.querySelector(`input[value="${state.habit}"]`);
   if (activeHabitRadio) activeHabitRadio.checked = true;
+  if (els.settingsBedtime) els.settingsBedtime.value = minutesToTimeValue(state.bedtimeMinutes);
 
-  const showSettingsToast = () => {
+  const showSettingsToast = (message = null) => {
     const h  = getHalfLifeMs() / (3600 * 1000);
     const mg = getSleepSafeThreshold();
-    els.profileToastMsg.textContent = `Updated: Half-life ${h}h, Sleep Safe ${mg}mg`;
+    els.profileToastMsg.textContent = message || `Updated: half-life ${h}h, threshold ${mg}mg`;
     els.profileToast.classList.add('visible');
     clearTimeout(profileToastTimeout);
     profileToastTimeout = setTimeout(() => els.profileToast.classList.remove('visible'), 3500);
@@ -320,6 +473,26 @@ function initSettings() {
 
   els.profileSelector.addEventListener('change', e => { state.profile = e.target.value; saveState(); showSettingsToast(); });
   els.habitSelector.addEventListener('change',   e => { state.habit   = e.target.value; saveState(); showSettingsToast(); });
+  const updateSettingsBedtime = (showToast = true) => {
+    if (!els.settingsBedtime) return;
+    const nextBedtime = parseTimeValue(els.settingsBedtime.value);
+    if (nextBedtime === state.bedtimeMinutes) return;
+    state.bedtimeMinutes = nextBedtime;
+    els.settingsBedtime.value = minutesToTimeValue(state.bedtimeMinutes);
+    graphWindowStartMs = null;
+    saveState();
+    if (showToast) showSettingsToast('Bedtime updated!');
+  };
+  const scheduleSettingsBedtimeUpdate = () => {
+    clearTimeout(bedtimeInputTimeout);
+    bedtimeInputTimeout = setTimeout(() => updateSettingsBedtime(true), 1200);
+  };
+  els.settingsBedtime?.addEventListener('input', scheduleSettingsBedtimeUpdate);
+  els.settingsBedtime?.addEventListener('change', scheduleSettingsBedtimeUpdate);
+  els.settingsBedtime?.addEventListener('blur', () => {
+    clearTimeout(bedtimeInputTimeout);
+    updateSettingsBedtime(true);
+  });
 
   els.sortableList.addEventListener('dragover', e => {
     e.preventDefault();
@@ -329,6 +502,38 @@ function initSettings() {
       if (afterElement == null) els.sortableList.appendChild(draggable);
       else els.sortableList.insertBefore(draggable, afterElement);
     }
+  });
+}
+
+function initBedtimePrompt() {
+  if (localStorage.getItem('awake-setup-complete') === 'true') return;
+  if (!els.bedtimeOverlay || !els.bedtimeSheet || !els.firstBedtime || !els.saveBedtimeBtn) return;
+
+  els.firstBedtime.value = minutesToTimeValue(state.bedtimeMinutes);
+  const firstProfileRadio = els.firstProfileSelector?.querySelector(`input[value="${state.profile}"]`);
+  if (firstProfileRadio) firstProfileRadio.checked = true;
+  const firstHabitRadio = els.firstHabitSelector?.querySelector(`input[value="${state.habit}"]`);
+  if (firstHabitRadio) firstHabitRadio.checked = true;
+  els.bedtimeOverlay.classList.remove('hidden');
+  els.bedtimeSheet.classList.remove('hidden');
+
+  els.saveBedtimeBtn.addEventListener('click', () => {
+    const selectedProfile = els.firstProfileSelector?.querySelector('input:checked');
+    const selectedHabit = els.firstHabitSelector?.querySelector('input:checked');
+    if (selectedProfile) state.profile = selectedProfile.value;
+    if (selectedHabit) state.habit = selectedHabit.value;
+    state.bedtimeMinutes = parseTimeValue(els.firstBedtime.value);
+    els.firstBedtime.value = minutesToTimeValue(state.bedtimeMinutes);
+    if (els.settingsBedtime) els.settingsBedtime.value = els.firstBedtime.value;
+    const activeProfileRadio = els.profileSelector?.querySelector(`input[value="${state.profile}"]`);
+    if (activeProfileRadio) activeProfileRadio.checked = true;
+    const activeHabitRadio = els.habitSelector?.querySelector(`input[value="${state.habit}"]`);
+    if (activeHabitRadio) activeHabitRadio.checked = true;
+    graphWindowStartMs = null;
+    localStorage.setItem('awake-setup-complete', 'true');
+    saveState();
+    els.bedtimeOverlay.classList.add('hidden');
+    els.bedtimeSheet.classList.add('hidden');
   });
 }
 
@@ -387,11 +592,28 @@ let rotVelX = 0,  rotVelY = 0;
 let rotDragging = false;
 let rotLastX = 0, rotLastY = 0;
 
-let activeLiquidMaterial = null;
-let activeCupMaterial    = null;
+let modelSwitchToken      = 0;
+let carouselModels        = [];
+let carouselDragProgress  = 0;
+let modelBounceStart      = 0;
+const CAROUSEL_SPACING    = 2.25;
+const PHONE_CAROUSEL_SPACING = 3.15;
+const PHONE_MODEL_SCALE_MULTIPLIER = 1.5;
+const MODEL_Y_OFFSET = -0.30;
+const PHONE_MODEL_Y_OFFSET = -0.04;
 
-let cappuccinoFoamTexture = null;
-let bounceStartTime       = 0;
+function getCarouselLayout() {
+  const isPhone = window.matchMedia('(max-width: 519px)').matches;
+  return {
+    spacing: isPhone ? PHONE_CAROUSEL_SPACING : CAROUSEL_SPACING,
+    scaleMultiplier: isPhone ? PHONE_MODEL_SCALE_MULTIPLIER : 1,
+    yOffset: isPhone ? PHONE_MODEL_Y_OFFSET : MODEL_Y_OFFSET,
+  };
+}
+
+function triggerModelBounce() {
+  modelBounceStart = Date.now();
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UI init
@@ -399,6 +621,7 @@ let bounceStartTime       = 0;
 function initUI() {
   renderCarouselDots();
   initSettings();
+  initBedtimePrompt();
 
   const tooltip = document.getElementById('modifier-tooltip');
   const closeTooltipBtn = document.getElementById('close-tooltip');
@@ -411,9 +634,12 @@ function initUI() {
   });
 
   const logoImg      = document.getElementById('logo-img');
-  const settingsIcon = document.getElementById('settings-btn-icon');
 
-  ['icons/awake_word_mark_green.svg', 'icons/setting_icon_green.svg', 'icons/body_insights_icon.svg'].forEach(src => {
+  [
+    'icons/awake_word_mark_green.svg',
+    'icons/arrow_black.svg',
+    'icons/arrow_green.svg',
+  ].forEach(src => {
     const img = new Image(); img.src = src;
   });
 
@@ -430,38 +656,35 @@ function initUI() {
   };
 
   setupImageSwap(logoImg,      'icons/awake_word_mark.svg',    'icons/awake_word_mark_green.svg');
-  setupImageSwap(settingsIcon, 'icons/setting_icon.svg',       'icons/setting_icon_green.svg');
-  setupImageSwap(els.fabInsightsIcon, 'icons/body_insights_icon_green.svg', 'icons/body_insights_icon.svg');
 
-  document.getElementById('logo-btn').addEventListener('click', () => switchToTab(0));
-  els.fabInsightsBtn.addEventListener('click', () => switchToTab(1));
-
-  let screenSwipeStartX = null;
-  let screenSwipeStartY = null;
-  const EDGE_THRESHOLD  = 50;
-
-  document.addEventListener('touchstart', e => {
-    if (e.touches.length === 1) {
-      screenSwipeStartX = e.touches[0].clientX;
-      screenSwipeStartY = e.touches[0].clientY;
-    }
-  }, { passive: true });
-
-  document.addEventListener('touchend', e => {
-    if (screenSwipeStartX === null) return;
-    const dx = e.changedTouches[0].clientX - screenSwipeStartX;
-    const dy = e.changedTouches[0].clientY - screenSwipeStartY;
-    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
-      if (currentTab === 0 && screenSwipeStartX > window.innerWidth - EDGE_THRESHOLD && dx < 0) switchToTab(1);
-      else if (currentTab === 1 && screenSwipeStartX < EDGE_THRESHOLD && dx > 0) switchToTab(0);
-    }
-    screenSwipeStartX = null;
-    screenSwipeStartY = null;
+  const logoBtn = document.getElementById('logo-btn');
+  logoBtn.addEventListener('click', () => {
+    logoBtn.classList.remove('logo-shake');
+    void logoBtn.offsetWidth;
+    logoBtn.classList.add('logo-shake');
   });
+  logoBtn.addEventListener('animationend', () => logoBtn.classList.remove('logo-shake'));
 
-  let swipeStartX   = 0;
-  let isPointerDown = false;
-  const swipeThreshold = 70;
+  const setupNavButton = (button, tabIndex) => {
+    if (!button) return;
+    const press = () => button.classList.add('is-pressing');
+    const release = () => button.classList.remove('is-pressing');
+    button.addEventListener('mousedown', press);
+    button.addEventListener('touchstart', press, { passive: true });
+    button.addEventListener('mouseup', release);
+    button.addEventListener('mouseleave', release);
+    button.addEventListener('touchend', release);
+    button.addEventListener('touchcancel', release);
+    button.addEventListener('click', () => switchToTab(tabIndex));
+  };
+
+  setupNavButton(els.navLogBtn, 0);
+  setupNavButton(els.navSleepBtn, 1);
+  updateBottomNav();
+
+  let swipeStartX      = 0;
+  let swipeStartY      = 0;
+  let isPointerDown    = false;
   let interactionMode  = 'none';
   const raycaster = new THREE.Raycaster();
   const mouse     = new THREE.Vector2();
@@ -475,27 +698,45 @@ function initUI() {
     if (camera && currentModelGroup) {
       raycaster.setFromCamera(mouse, camera);
       if (raycaster.intersectObject(currentModelGroup, true).length > 0) {
-        interactionMode = 'rotate';
-        bounceStartTime = Date.now(); // Trigger the spring bounce animation
+        interactionMode = 'rotate-candidate';
       }
     }
     
-    swipeStartX   = clientX;
-    isPointerDown = true;
+    swipeStartX     = clientX;
+    swipeStartY     = clientY;
+    carouselDragProgress = 0;
+    isPointerDown   = true;
     rotLastX = clientX; rotLastY = clientY;
-    rotDragging = interactionMode === 'rotate';
+    rotDragging = false;
     rotVelX = 0; rotVelY = 0;
   };
 
   const handlePointerMove = (clientX, clientY) => {
     if (!isPointerDown) return;
+    const dx = clientX - swipeStartX;
+    const dy = clientY - swipeStartY;
+
+    if (interactionMode === 'rotate-candidate') {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      if (Math.abs(dx) > Math.abs(dy) * 1.15) {
+        interactionMode = 'carousel';
+      } else {
+        interactionMode = 'rotate';
+        rotDragging = true;
+      }
+    }
+
     if (interactionMode === 'carousel') {
-      const dx = clientX - swipeStartX;
-      if (Math.abs(dx) > swipeThreshold) {
+      if (Math.abs(dx) > Math.abs(dy) * 1.15) {
         const orderedDrinks = getOrderedDrinks();
         const currentIndex  = orderedDrinks.findIndex(d => d.id === state.selectedDrinkId);
-        if (dx < 0 && currentIndex < orderedDrinks.length - 1) { selectDrink(currentIndex + 1); swipeStartX = clientX; }
-        else if (dx > 0 && currentIndex > 0)                   { selectDrink(currentIndex - 1); swipeStartX = clientX; }
+        const canMovePrev   = currentIndex > 0;
+        const canMoveNext   = currentIndex < orderedDrinks.length - 1;
+        const rawProgress   = dx / Math.max(1, els.canvasContainer.clientWidth * 0.58);
+        const minProgress   = canMoveNext ? -1 : -0.12;
+        const maxProgress   = canMovePrev ? 1 : 0.12;
+        carouselDragProgress = clamp(rawProgress, minProgress, maxProgress);
+        updateCarouselModelTransforms();
       }
     } else if (interactionMode === 'rotate') {
       const frameDx = clientX - rotLastX;
@@ -508,7 +749,26 @@ function initUI() {
     }
   };
 
-  const handlePointerEnd = () => { isPointerDown = false; rotDragging = false; interactionMode = 'none'; };
+  const handlePointerEnd = () => {
+    if (interactionMode === 'carousel') {
+      const orderedDrinks = getOrderedDrinks();
+      const currentIndex  = orderedDrinks.findIndex(d => d.id === state.selectedDrinkId);
+      let nextIndex       = currentIndex;
+      if (carouselDragProgress < -0.32) nextIndex = currentIndex + 1;
+      else if (carouselDragProgress > 0.32) nextIndex = currentIndex - 1;
+      if (nextIndex >= 0 && nextIndex < orderedDrinks.length && nextIndex !== currentIndex) {
+        selectDrink(nextIndex);
+      } else {
+        carouselDragProgress = 0;
+        updateCarouselModelTransforms();
+      }
+    } else if (interactionMode === 'rotate-candidate') {
+      triggerModelBounce();
+    }
+    isPointerDown = false;
+    rotDragging = false;
+    interactionMode = 'none';
+  };
 
   els.swipeZone.addEventListener('touchstart', e => handlePointerStart(e.touches[0].clientX, e.touches[0].clientY), { passive: true });
   els.swipeZone.addEventListener('touchmove',  e => handlePointerMove(e.touches[0].clientX,  e.touches[0].clientY), { passive: true });
@@ -525,11 +785,10 @@ function initUI() {
       ? `${state.selectedModifier.charAt(0).toUpperCase() + state.selectedModifier.slice(1)} ${drink.name}`
       : drink.name;
     
-    predictionFreezeTime = Date.now() + 1000;
     state.log.push({ id: Date.now(), name: logName, mg, time: Date.now() });
     saveState();
     
-    els.addBtn.textContent = 'Added! ✓';
+    els.addBtn.textContent = '✓ Added';
     els.addBtn.classList.add('success');
     
     setTimeout(() => { 
@@ -555,6 +814,24 @@ function initUI() {
     }
   });
 
+  els.logAccordionBtn?.addEventListener('click', () => {
+    if (!els.logCard) return;
+    const isCollapsed = els.logCard.classList.toggle('collapsed');
+    els.logAccordionBtn.setAttribute('aria-expanded', String(!isCollapsed));
+    if (els.logAccordionIcon) {
+      els.logAccordionIcon.src = 'icons/arrow_green.svg';
+      setTimeout(() => { els.logAccordionIcon.src = 'icons/arrow_black.svg'; }, 180);
+    }
+  });
+
+  const setLogAccordionIcon = src => {
+    if (els.logAccordionIcon) els.logAccordionIcon.src = src;
+  };
+  els.logAccordionBtn?.addEventListener('pointerdown', () => setLogAccordionIcon('icons/arrow_green.svg'));
+  els.logAccordionBtn?.addEventListener('pointerup', () => setLogAccordionIcon('icons/arrow_black.svg'));
+  els.logAccordionBtn?.addEventListener('pointerleave', () => setLogAccordionIcon('icons/arrow_black.svg'));
+  els.logAccordionBtn?.addEventListener('pointercancel', () => setLogAccordionIcon('icons/arrow_black.svg'));
+
   function showUndoToast() {
     els.undoToast.classList.add('visible');
     clearTimeout(undoTimeout);
@@ -571,20 +848,100 @@ function initUI() {
     }
   };
 
-  function handleScrub(e) {
-    const rect    = els.graphCanvas.getBoundingClientRect();
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    scrubX        = Math.max(0, Math.min(clientX - rect.left, rect.width));
+  const handleGraphPanStart = clientX => {
+    graphIsPanning = true;
+    graphPanStartX = clientX;
+    graphPanStartMs = graphWindowStartMs ?? getDefaultGraphStartMs();
+    const rect = els.graphCanvas.getBoundingClientRect();
+    scrubX = clamp(clientX - rect.left, 0, rect.width);
+    graphTooltip = null;
     updateUI();
-  }
-  els.graphCanvas.addEventListener('touchstart', handleScrub, { passive: true });
-  els.graphCanvas.addEventListener('touchmove',  handleScrub, { passive: true });
-  els.graphCanvas.addEventListener('mousedown',  handleScrub);
-  els.graphCanvas.addEventListener('mousemove',  e => { if (e.buttons === 1) handleScrub(e); });
-  const resetScrub = () => { scrubX = null; updateUI(); };
-  els.graphCanvas.addEventListener('touchend',   resetScrub);
-  els.graphCanvas.addEventListener('mouseup',    resetScrub);
-  els.graphCanvas.addEventListener('mouseleave', resetScrub);
+  };
+  const handleGraphPanMove = clientX => {
+    if (!graphIsPanning) return;
+    const rect = els.graphCanvas.getBoundingClientRect();
+    const dx = clientX - graphPanStartX;
+    graphWindowStartMs = graphPanStartMs - (dx / Math.max(1, rect.width)) * GRAPH_WINDOW_MS;
+    scrubX = clamp(clientX - rect.left, 0, rect.width);
+    graphTooltip = null;
+    updateUI();
+  };
+  const handleGraphPanEnd = () => {
+    graphIsPanning = false;
+  };
+  const handleGraphClick = e => {
+    const canvas = els.graphCanvas;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+    const width = rect.width;
+    const height = rect.height;
+    const nowMs = Date.now();
+    const viewStart = graphWindowStartMs ?? getDefaultGraphStartMs();
+    const viewEnd = viewStart + GRAPH_WINDOW_MS;
+    const bedtimeMs = getTargetBedtimeMs(nowMs);
+    const sleepLogs = getSleepWindowLogs(state.log, bedtimeMs);
+    const threshold = getSleepSafeThreshold();
+    const graphTop = 4;
+    const graphBottom = height - 6;
+    const graphHeight = Math.max(120, graphBottom - graphTop);
+    const samples = Array.from({ length: 96 }, (_, i) => {
+      const time = viewStart + ((viewEnd - viewStart) * (i / 95));
+      return getTotalDecayedCaffeine(sleepLogs, time);
+    });
+    const maxMg = Math.max(60, threshold * 1.9, ...samples) * 1.04;
+    const toX = time => ((time - viewStart) / (viewEnd - viewStart)) * width;
+    const toY = mg => graphTop + graphHeight - ((mg / maxMg) * graphHeight);
+    const markerHit = (x, y) => Math.hypot(clickX - x, clickY - y) <= 18;
+
+    if (nowMs >= viewStart && nowMs <= viewEnd) {
+      const currentX = clamp(toX(nowMs), 1, width - 1);
+      const currentY = toY(calculateCurrentCaffeine().current);
+      if (markerHit(currentX, currentY)) {
+        scrubX = null;
+        graphTooltip = { x: currentX, y: currentY, text: 'This is your current caffeine level' };
+        updateUI();
+        return;
+      }
+    }
+
+    if (bedtimeMs >= viewStart && bedtimeMs <= viewEnd) {
+      const bedX = clamp(toX(bedtimeMs), 1, width - 1);
+      const bedtimeMg = Math.round(getTotalDecayedCaffeine(sleepLogs, bedtimeMs));
+      const bedY = toY(bedtimeMg);
+      if (markerHit(bedX, bedY)) {
+        scrubX = null;
+        graphTooltip = { x: bedX, y: bedY, text: `This is your level at bedtime: ${bedtimeMg} mg` };
+        updateUI();
+        return;
+      }
+    }
+
+    graphTooltip = null;
+    scrubX = clamp(clickX, 0, width);
+    updateUI();
+  };
+  els.graphCanvas.addEventListener('touchstart', e => handleGraphPanStart(e.touches[0].clientX), { passive: true });
+  els.graphCanvas.addEventListener('touchmove',  e => handleGraphPanMove(e.touches[0].clientX), { passive: true });
+  els.graphCanvas.addEventListener('touchend',   handleGraphPanEnd);
+  els.graphCanvas.addEventListener('mousedown',  e => handleGraphPanStart(e.clientX));
+  els.graphCanvas.addEventListener('mousemove',  e => handleGraphPanMove(e.clientX));
+  els.graphCanvas.addEventListener('mouseup',    handleGraphPanEnd);
+  els.graphCanvas.addEventListener('click',      handleGraphClick);
+  els.graphCanvas.addEventListener('mouseleave', handleGraphPanEnd);
+  els.graphCanvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    graphWindowStartMs = (graphWindowStartMs ?? getDefaultGraphStartMs()) + e.deltaY * 60000;
+    updateUI();
+  }, { passive: false });
+  document.addEventListener('pointerdown', e => {
+    if (!els.graphCanvas || e.target === els.graphCanvas) return;
+    if (scrubX === null && graphTooltip === null) return;
+    scrubX = null;
+    graphTooltip = null;
+    updateUI();
+  });
 
   updateUI();
   setInterval(updateUI, 1000);
@@ -593,7 +950,7 @@ function initUI() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Bar Graph drawing
 // ─────────────────────────────────────────────────────────────────────────────
-function drawGraph(todayLogs, currentMg) {
+function drawGraph(todayLogs, currentMg, sleepForecast) {
   const canvas = els.graphCanvas;
   if (!canvas || canvas.offsetParent === null) return;
   const ctx    = canvas.getContext('2d');
@@ -606,68 +963,167 @@ function drawGraph(todayLogs, currentMg) {
   const height = rect.height;
   ctx.clearRect(0, 0, width, height);
 
-  const now        = new Date();
-  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 6, 0, 0).getTime();
-  const endOfDay   = startOfDay + (18 * 3600000);
+  const nowMs = Date.now();
+  if (graphWindowStartMs === null) graphWindowStartMs = getDefaultGraphStartMs();
+  const viewStart = graphWindowStartMs;
+  const viewEnd = viewStart + GRAPH_WINDOW_MS;
+  const bedtimeMs = sleepForecast?.bedtimeMs || getTargetBedtimeMs();
+  const threshold  = getSleepSafeThreshold();
+  const graphTop = 4;
+  const graphBottom = height - 6;
+  const graphHeight = Math.max(120, graphBottom - graphTop);
+  const toX = time => ((time - viewStart) / (viewEnd - viewStart)) * width;
 
-  const numBars = 36;
+  const numPoints = 144;
   const points = [];
-  for (let i = 0; i < numBars; i++) {
-    const time = startOfDay + ((endOfDay - startOfDay) * (i / (numBars - 1)));
-    points.push({ time, x: (i / (numBars - 1)) * width, y: getTotalDecayedCaffeine(todayLogs, time) });
+  for (let i = 0; i < numPoints; i++) {
+    const time = viewStart + ((viewEnd - viewStart) * (i / (numPoints - 1)));
+    points.push({ time, mg: getTotalDecayedCaffeine(todayLogs, time) });
   }
 
-  const maxMg = Math.max(100, ...points.map(p => p.y)) * 1.2;
-  const barWidth = (width / numBars) * 0.7; 
+  const maxMg = Math.max(60, threshold * 1.9, ...points.map(p => p.mg)) * 1.04;
+  const toY = mg => graphTop + graphHeight - ((mg / maxMg) * graphHeight);
 
-  const currentTime = Date.now();
+  const phasePattern = [
+    { name: 'Light sleep', color: 'rgba(255, 255, 255, 0.46)', level: 0.30, length: 30 },
+    { name: 'Deep sleep', color: 'rgba(73, 204, 56, 0.16)', level: 0.72, length: 35 },
+    { name: 'REM sleep', color: 'rgba(0, 0, 0, 0.06)', level: 0.48, length: 25 },
+  ];
 
-  points.forEach(p => {
-    const barHeight = (p.y / maxMg) * height;
-    if (barHeight < 1) return; 
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.26)';
+  ctx.beginPath();
+  ctx.rect(0, graphTop, width, graphHeight);
+  ctx.fill();
 
-    const xPos = p.x - (barWidth / 2);
-    const yPos = height - barHeight;
+  let phaseStart = bedtimeMs;
+  const nightEnd = bedtimeMs + (8 * 3600000);
+  let phaseIndex = 0;
+  const renderedPhaseLabels = new Set();
+  while (phaseStart < viewEnd && phaseStart < nightEnd) {
+    const phase = phasePattern[Math.abs(phaseIndex) % phasePattern.length];
+    const phaseEnd = Math.min(viewEnd, nightEnd, phaseStart + phase.length * 60000);
+    const x = clamp(toX(phaseStart), 0, width);
+    const x2 = clamp(toX(phaseEnd), 0, width);
+    const y = graphTop + (graphHeight * phase.level);
+    const h = phase.level > 0.6 ? graphHeight * 0.22 : graphHeight * 0.16;
+    if (x2 > 0 && x < width) {
+      ctx.fillStyle = phase.color;
+      ctx.beginPath();
+      ctx.rect(x, y - h / 2, Math.max(1, x2 - x - 2), h);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(152, 152, 157, 0.92)';
+      ctx.font = '700 10px "Open Sans", sans-serif';
+      ctx.textBaseline = 'middle';
+      if (!renderedPhaseLabels.has(phase.name)) {
+        renderedPhaseLabels.add(phase.name);
+        const labelX = clamp(x + 6, 6, width - ctx.measureText(phase.name).width - 6);
+        ctx.fillText(phase.name, labelX, y);
+      }
+    }
+    phaseStart = phaseEnd;
+    phaseIndex += 1;
+  }
 
-    ctx.fillStyle = (p.time > currentTime) ? 'rgba(200, 200, 200, 0.4)' : 'rgba(160, 160, 160, 0.9)'; 
-
-    ctx.beginPath();
-    if (ctx.roundRect) ctx.roundRect(xPos, yPos, barWidth, barHeight, [3, 3, 0, 0]);
-    else ctx.rect(xPos, yPos, barWidth, barHeight);
-    ctx.fill();
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const x = toX(p.time);
+    const y = toY(p.mg);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   });
+  ctx.strokeStyle = 'rgba(150, 150, 154, 0.72)';
+  ctx.lineWidth = 1.8;
+  ctx.lineCap = 'butt';
+  ctx.lineJoin = 'miter';
+  ctx.stroke();
+
+  if (bedtimeMs >= viewStart && bedtimeMs <= viewEnd) {
+    const bedX = clamp(toX(bedtimeMs), 1, width - 1);
+    const bedY = toY(getTotalDecayedCaffeine(todayLogs, bedtimeMs));
+    ctx.beginPath();
+    ctx.arc(bedX, bedY, 4.2, 0, Math.PI * 2);
+    ctx.fillStyle = '#000000';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.stroke();
+  }
 
   if (scrubX !== null) {
-    const timeAtScrub = startOfDay + (scrubX / width) * (endOfDay - startOfDay);
+    const timeAtScrub = viewStart + (scrubX / width) * (viewEnd - viewStart);
     const mgAtScrub   = getTotalDecayedCaffeine(todayLogs, timeAtScrub);
-    const scrubY      = height - ((mgAtScrub / maxMg) * height);
-
-    ctx.beginPath();
-    ctx.setLineDash([4, 4]);
-    ctx.moveTo(scrubX, 0); ctx.lineTo(scrubX, height);
-    ctx.strokeStyle = 'rgba(100, 100, 100, 0.5)'; ctx.lineWidth = 1.5;
-    ctx.stroke(); ctx.setLineDash([]);
+    const scrubY      = toY(mgAtScrub);
 
     ctx.beginPath();
     ctx.arc(scrubX, scrubY, 5, 0, Math.PI * 2);
     ctx.fillStyle = '#888888'; ctx.fill();
     ctx.lineWidth = 2; ctx.strokeStyle = '#FFFFFF'; ctx.stroke();
 
-    ctx.fillStyle = '#000000';
-    ctx.font      = '12px inherit';
+    ctx.font      = '700 12px "Space Mono", monospace';
     const text      = `${Math.round(mgAtScrub)} mg`;
-    const textWidth = ctx.measureText(text).width;
-    const textX     = (scrubX + 8 + textWidth > width) ? scrubX - 8 - textWidth : scrubX + 8;
-    ctx.fillText(text, textX, Math.max(12, scrubY - 8));
-  } else {
-    if (currentTime >= startOfDay && currentTime <= endOfDay) {
-      const currentX = ((currentTime - startOfDay) / (endOfDay - startOfDay)) * width;
-      const currentY = height - ((currentMg / maxMg) * height);
-      ctx.beginPath();
-      ctx.arc(currentX, currentY, 4.5, 0, Math.PI * 2);
-      ctx.fillStyle = '#000000'; ctx.fill();
-      ctx.lineWidth = 2.5; ctx.strokeStyle = '#FFFFFF'; ctx.stroke();
+    const tooltipPaddingX = 10;
+    const tooltipHeight = 30;
+    const tooltipWidth = ctx.measureText(text).width + (tooltipPaddingX * 2);
+    const tooltipX = clamp(scrubX - tooltipWidth / 2, 4, width - tooltipWidth - 4);
+    const tooltipY = clamp(scrubY - tooltipHeight - 12, 4, height - tooltipHeight - 4);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.88)';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(tooltipX, tooltipY, tooltipWidth, tooltipHeight, 12);
+    else ctx.rect(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
+    ctx.fill();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, tooltipX + tooltipPaddingX, tooltipY + tooltipHeight / 2);
+  }
+
+  if (nowMs >= viewStart && nowMs <= viewEnd) {
+    const currentX = clamp(toX(nowMs), 1, width - 1);
+    const currentY = toY(currentMg);
+    ctx.beginPath();
+    ctx.arc(currentX, currentY, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#49cc38';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.stroke();
+  }
+
+  if (graphTooltip) {
+    const tooltipPaddingX = 10;
+    const tooltipHeight = 32;
+    ctx.font = '700 11px "Open Sans", sans-serif';
+    const tooltipWidth = ctx.measureText(graphTooltip.text).width + (tooltipPaddingX * 2);
+    const tooltipX = clamp(graphTooltip.x - tooltipWidth / 2, 4, width - tooltipWidth - 4);
+    const tooltipY = clamp(graphTooltip.y - tooltipHeight - 12, 4, height - tooltipHeight - 4);
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.88)';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(tooltipX, tooltipY, tooltipWidth, tooltipHeight, 12);
+    else ctx.rect(tooltipX, tooltipY, tooltipWidth, tooltipHeight);
+    ctx.fill();
+    ctx.fillStyle = '#FFFFFF';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(graphTooltip.text, tooltipX + tooltipPaddingX, tooltipY + tooltipHeight / 2);
+  }
+
+  if (els.graphLabels) {
+    const axisItems = [];
+    const twoHoursMs = 2 * 3600000;
+    const firstTick = Math.ceil(viewStart / twoHoursMs) * twoHoursMs;
+    for (let t = firstTick; t <= viewEnd; t += twoHoursMs) {
+      let className = '';
+      if (Math.abs(t - viewStart) < 60000) className = 'axis-edge-start';
+      if (Math.abs(t - viewEnd) < 60000) className = 'axis-edge-end';
+      axisItems.push({ time: t, text: formatAxisOrientation(t), className });
     }
+
+    els.graphLabels.innerHTML = '';
+    axisItems.forEach(item => {
+      const label = document.createElement('span');
+      label.textContent = item.text;
+      label.className = item.className;
+      label.style.left = `${clamp(((item.time - viewStart) / GRAPH_WINDOW_MS) * 100, 0, 100)}%`;
+      els.graphLabels.appendChild(label);
+    });
   }
 }
 
@@ -677,9 +1133,12 @@ function drawGraph(todayLogs, currentMg) {
 function updateUI() {
   const orderedDrinks = getOrderedDrinks();
   const drink         = orderedDrinks.find(d => d.id === state.selectedDrinkId) || orderedDrinks[0];
-  const currentMg     = getCurrentSelectionMg();
-  const todayLogs     = state.log.filter(e => new Date(e.time).toDateString() === new Date().toDateString());
+  const selectedMg    = getCurrentSelectionMg();
+  const todayLogs     = getTodayLogs();
   const physio        = calculateCurrentCaffeine();
+  const status        = getCaffeineStatus(physio.current);
+  const currentForecast = getSleepForecast(0);
+  const sleepWindowLogs = getSleepWindowLogs(state.log, currentForecast.bedtimeMs);
 
   Array.from(els.dots.children).forEach((dot, i) => {
     dot.classList.toggle('active', orderedDrinks[i] && orderedDrinks[i].id === drink.id);
@@ -687,14 +1146,10 @@ function updateUI() {
 
   renderModifierToggle(drink);
   els.name.textContent = drink.name;
-  els.mg.textContent   = currentMg;
-
-  if (Date.now() > predictionFreezeTime) {
-    const predictions            = getFixedPredictions(currentMg);
-    els.peakTime.textContent     = formatTime(predictions.peak);
-    els.halfLifeTime.textContent = formatTime(predictions.halfLife);
-    els.sleepTime.textContent    = formatTime(predictions.sleepSafe);
-  }
+  fitDrinkName();
+  els.mg.textContent   = selectedMg;
+  if (els.caffeineStatus) els.caffeineStatus.textContent = status.label;
+  if (els.thresholdDetail) els.thresholdDetail.textContent = status.detail;
 
   if (prevBloodMg !== null && prevBloodMg !== physio.current) {
     els.bloodMg.classList.add('flash-green');
@@ -703,26 +1158,16 @@ function updateUI() {
   prevBloodMg = physio.current;
   els.bloodMg.textContent = `${physio.current}`;
 
-  const currentStats           = getFixedPredictions(0);
-  els.insightPeak.textContent  = formatTime(currentStats.peak);
-  els.insightHalf.textContent  = formatTime(currentStats.halfLife);
-  els.insightSleep.textContent = formatTime(currentStats.sleepSafe);
+  els.insightSleep.textContent = `${currentForecast.score}/100`;
+  if (els.bedtimeCaffeine) els.bedtimeCaffeine.textContent = `${currentForecast.bedtimeMg} mg`;
+  if (els.deepSleepImpact) els.deepSleepImpact.textContent = currentForecast.deepImpact;
+  if (els.remSleepImpact) els.remSleepImpact.textContent = currentForecast.remImpact;
 
   const phase             = getPhase(physio.current, todayLogs);
-  els.phaseTag.textContent = phase.label;
-  els.phaseTag.className  = `phase-tag ${phase.class}`;
-
-  els.cardPeak.classList.remove('active-phase');
-  els.cardHalf.classList.remove('active-phase');
-  els.cardSleep.classList.remove('active-phase');
-  
-  if      (phase.id === 'ascending') els.cardPeak.classList.add('active-phase');
-  else if (phase.id === 'declining') els.cardHalf.classList.add('active-phase');
-  else                               els.cardSleep.classList.add('active-phase');
-
-  if (els.insightPeakIcon)  els.insightPeakIcon.src  = (phase.id === 'ascending') ? 'icons/flash_icon_green.svg' : 'icons/flash_icon.svg';
-  if (els.insightHalfIcon)  els.insightHalfIcon.src  = (phase.id === 'declining') ? 'icons/clock_icon_green.svg' : 'icons/clock_icon.svg';
-  if (els.insightSleepIcon) els.insightSleepIcon.src = (phase.id !== 'ascending' && phase.id !== 'declining') ? 'icons/moon_icon_green.svg' : 'icons/moon_icon.svg';
+  if (els.phaseTag) {
+    els.phaseTag.textContent = phase.label;
+    els.phaseTag.className  = `phase-tag ${phase.class}`;
+  }
 
   els.logList.innerHTML = '';
   if (todayLogs.length === 0) {
@@ -744,7 +1189,7 @@ function updateUI() {
     });
   }
 
-  drawGraph(todayLogs, physio.current);
+  drawGraph(sleepWindowLogs, physio.current, currentForecast);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -754,86 +1199,34 @@ const glbCache   = {};
 const gltfLoader = new GLTFLoader();
 
 const DRINK_3D = {
-  espresso:        { file: 'models/espresso.glb',        scale: 0.8 },
-  americano:       { file: 'models/americano.glb',       scale: 1.0 },
-  cappuccino:      { file: 'models/cappuccino.glb',      scale: 0.9 },
-  latte_macchiato: { file: 'models/latte_macchiato.glb', scale: 0.9 },
-  cafe_crema:      { file: 'models/cafe_crema.glb',      scale: 1.0 },
-  filter:          { file: 'models/filtered_coffee.glb', scale: 0.9 },
-  green_tea:       { file: 'models/tea_green.glb',       scale: 0.8 },
+  espresso:        { file: 'models/espresso.glb',        scale: 0.64 },
+  americano:       { file: 'models/americano.glb',       scale: 0.8 },
+  cappuccino:      { file: 'models/cappuccino.glb',      scale: 0.72 },
+  latte_macchiato: { file: 'models/latte_macchiato.glb', scale: 0.81, rotationY: -Math.PI / 6 },
+  cafe_crema:      { file: 'models/cafe_crema.glb',      scale: 0.8 },
+  filter:          { file: 'models/filtered_coffee.glb', scale: 0.72 },
+  green_tea:       { file: 'models/tea_green.glb',       scale: 0.48 },
   black_tea:       { file: 'models/tea_black.glb',       scale: 0.8 },
   mate:            { file: 'models/mate.glb',            scale: 0.9 },
-  matcha:          { file: 'models/matcha.glb',          scale: 0.9 },
+  matcha:          { file: 'models/matcha.glb',          scale: 1.08 },
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3D — material assignment per drink
+// 3D — GLB preparation
 // ─────────────────────────────────────────────────────────────────────────────
-function processGLB(gltfScene, cfg, drinkId) {
+function processGLB(gltfScene, cfg) {
   const model = gltfScene.clone(true);
 
-  // Helper function to easily apply exported materials to mesh names
-  const applyMaterials = (node, nameFilterMatMap) => {
-    if (!node.isMesh) return;
-    const name = node.name.toLowerCase();
-    for (const [filter, mat] of Object.entries(nameFilterMatMap)) {
-      if (name.includes(filter)) {
-        node.material = mat;
-        if (filter.includes('liquid') || filter.includes('foam')) activeLiquidMaterial = mat;
-        if (filter.includes('cup') || filter.includes('glass')) activeCupMaterial = mat;
-        return;
-      }
-    }
-    // Fallback material
-    node.material = new THREE.MeshPhysicalMaterial({
-      color: 0xffffff, metalness: 0.0, roughness: 0.15,
-      clearcoat: 1.0, clearcoatRoughness: 0.05,
-    });
-  };
+  model.traverse(child => {
+    if (!child.isMesh) return;
 
-  if (drinkId === 'espresso') {
-    const { liquidMat } = applyEspressoShaders(model); 
-    activeLiquidMaterial = liquidMat; 
-    activeCupMaterial = espressoCupMaterial; 
-  } 
-  else if (drinkId === 'cappuccino') {
-    const foamMat = cappuccinoFoamTexture ? createCappuccinoFoamMaterial(cappuccinoFoamTexture) : new THREE.MeshStandardMaterial({ color: 0xc68e58 });
-    model.traverse(child => {
-      if (!child.isMesh) return;
-      const name = child.name.toLowerCase();
-      if (name.includes('liquid')) {
-        activeLiquidMaterial = foamMat; child.material = foamMat; child.castShadow = false; child.receiveShadow = false;
-      } else if (name.includes('cup')) {
-        activeCupMaterial = cappuccinoCupMaterial; child.material = cappuccinoCupMaterial; child.castShadow = true; child.receiveShadow = true;
-      }
-    });
-  } 
-  else if (drinkId === 'americano') {
-    model.traverse(child => applyMaterials(child, { 'liquid': americanoLiquid, 'cup': americanoCup }));
-  } 
-  else if (drinkId === 'filter') {
-    model.traverse(child => applyMaterials(child, { 'liquid': filterLiquid, 'cup': filterCup }));
-  } 
-  else if (drinkId === 'latte_macchiato') {
-    model.traverse(child => applyMaterials(child, { 'liquid': latteLiquid, 'glass': latteGlass, 'cup': latteGlass }));
-  } 
-  else if (drinkId === 'matcha') {
-    model.traverse(child => applyMaterials(child, { 'liquid': matchaLiquid, 'cup': matchaCup }));
-  } 
-  else if (drinkId === 'mate') {
-    model.traverse(child => applyMaterials(child, { 'liquid': mateLiquid, 'straw': mateStraw, 'bombilla': mateStraw, 'cup': mateCup }));
-  } 
-  else if (drinkId === 'black_tea' || drinkId === 'green_tea') {
-    model.traverse(child => applyMaterials(child, { 'liquid': teaLiquid, 'cup': teaGlass, 'glass': teaGlass }));
-  } 
- else if (drinkId === 'cafe_crema') {
-    const { liquidMat } = applyCafeCremaShaders(model); 
-    activeLiquidMaterial = liquidMat; 
-    activeCupMaterial = cafeCremaCupMaterial; 
-  }
-  else {
-    model.traverse(child => applyMaterials(child, {}));
-  }
+    if (child.geometry) child.geometry = child.geometry.clone();
+    if (Array.isArray(child.material)) child.material = child.material.map(material => material.clone());
+    else if (child.material) child.material = child.material.clone();
+
+    child.castShadow = true;
+    child.receiveShadow = true;
+  });
 
   const box    = new THREE.Box3().setFromObject(model);
   const center = box.getCenter(new THREE.Vector3());
@@ -843,11 +1236,12 @@ function processGLB(gltfScene, cfg, drinkId) {
   const maxDim    = Math.max(size.x, size.y, size.z);
   const autoScale = maxDim > 0 ? (1.6 / maxDim) : 1.0;
   
-  // Save original scale for the bounce interaction to reference
-  model.userData.baseScale = autoScale * (cfg.scale || 1.0);
-  model.scale.setScalar(model.userData.baseScale);
+  const wrapper = new THREE.Group();
+  wrapper.userData.baseScale = autoScale * (cfg.scale || 1.0);
+  wrapper.userData.rotationYOffset = cfg.rotationY || 0;
+  wrapper.add(model);
 
-  return model;
+  return wrapper;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -859,13 +1253,13 @@ function loadAndBuildGLB(drinkId) {
     const fileUrl = cfg.file;
 
     if (glbCache[fileUrl]) {
-      resolve(processGLB(glbCache[fileUrl], cfg, drinkId));
+      resolve(processGLB(glbCache[fileUrl], cfg));
       return;
     }
 
     gltfLoader.load(
       fileUrl,
-      gltf => { glbCache[fileUrl] = gltf.scene; resolve(processGLB(gltf.scene, cfg, drinkId)); },
+      gltf => { glbCache[fileUrl] = gltf.scene; resolve(processGLB(gltf.scene, cfg)); },
       undefined,
       err  => { console.error('Error loading 3D model:', fileUrl, err); resolve(new THREE.Group()); }
     );
@@ -875,6 +1269,24 @@ function loadAndBuildGLB(drinkId) {
 // ─────────────────────────────────────────────────────────────────────────────
 // 3D — scene init
 // ─────────────────────────────────────────────────────────────────────────────
+function disposeModel(model) {
+  if (!model) return;
+  const disposedMaterials = new Set();
+
+  model.traverse(child => {
+    if (!child.isMesh) return;
+
+    if (child.geometry) child.geometry.dispose();
+
+    const materials = Array.isArray(child.material) ? child.material : [child.material];
+    materials.forEach(material => {
+      if (!material || disposedMaterials.has(material)) return;
+      if (material.dispose) material.dispose();
+      disposedMaterials.add(material);
+    });
+  });
+}
+
 function init3D() {
   const container = els.canvasContainer;
   scene = new THREE.Scene();
@@ -907,13 +1319,6 @@ function init3D() {
   fill.position.set(2, 4, 3);
   scene.add(fill);
 
-  new THREE.TextureLoader().load(
-    'shader_images/cappuccino_foam.png',
-    tex => { cappuccinoFoamTexture = tex; },
-    undefined,
-    err => console.error('cappuccino_foam.png failed to load:', err)
-  );
-
   switch3DModel(state.selectedDrinkId);
   animate3D();
 }
@@ -921,33 +1326,73 @@ function init3D() {
 // ─────────────────────────────────────────────────────────────────────────────
 // 3D — swap model on drink change
 // ─────────────────────────────────────────────────────────────────────────────
+function disposeCarouselModels() {
+  carouselModels.forEach(model => {
+    scene.remove(model);
+    disposeModel(model);
+  });
+  carouselModels = [];
+  currentModelGroup = null;
+}
+
+function updateCarouselModelTransforms(t = Date.now() * 0.001) {
+  const layout = getCarouselLayout();
+  const bounceElapsed = modelBounceStart ? (Date.now() - modelBounceStart) / 1000 : 999;
+  const bounceProgress = clamp(bounceElapsed / 1, 0, 1);
+  const bounceAmount = bounceProgress < 1
+    ? Math.sin(bounceProgress * Math.PI * 2.6) * (1 - bounceProgress) * 0.035
+    : 0;
+  carouselModels.forEach(model => {
+    const offset    = (model.userData.carouselOffset || 0) + carouselDragProgress;
+    const distance  = Math.min(Math.abs(offset), 1.4);
+    const baseScale = model.userData.baseScale || 1.0;
+
+    model.position.x = offset * layout.spacing;
+    model.position.y = layout.yOffset + Math.sin(t * 1.1) * 0.04;
+    model.position.z = -distance * 0.22;
+    model.rotation.x = rotX;
+    model.rotation.y = rotY + (model.userData.rotationYOffset || 0) - offset * 0.22;
+    const activeBounce = Math.abs(offset) < 0.08 ? bounceAmount : 0;
+    model.scale.setScalar(baseScale * layout.scaleMultiplier * (1 - distance * 0.13) * (1 + activeBounce));
+    model.visible = Math.abs(offset) < 1.55;
+  });
+}
+
 async function switch3DModel(drinkId) {
   if (!scene) return;
+  const switchToken = ++modelSwitchToken;
 
-  if (currentModelGroup) {
-    currentModelGroup.traverse(child => {
-      if (child.isMesh) {
-        child.geometry.dispose();
-        if (child.material.map) child.material.map.dispose();
-        
-        const isShared = child.material === cappuccinoCupMaterial
-                      || child.material === espressoCupMaterial; 
-                      
-        if (!isShared && child.material.dispose) child.material.dispose();
-      }
-    });
-    scene.remove(currentModelGroup);
-  }
-
-  currentModelGroup    = null;
-  activeLiquidMaterial = null;
-  activeCupMaterial    = null;
+  disposeCarouselModels();
+  carouselDragProgress = 0;
 
   rotX = 0.35; rotY = 0; rotVelX = 0; rotVelY = 0;
 
-  const model       = await loadAndBuildGLB(drinkId);
-  currentModelGroup = model;
-  scene.add(currentModelGroup);
+  const orderedDrinks = getOrderedDrinks();
+  const currentIndex  = Math.max(0, orderedDrinks.findIndex(d => d.id === drinkId));
+  const carouselItems = [-1, 0, 1]
+    .map(offset => ({ offset, drink: orderedDrinks[currentIndex + offset] }))
+    .filter(item => item.drink);
+
+  const loadedModels = await Promise.all(
+    carouselItems.map(async item => {
+      const model = await loadAndBuildGLB(item.drink.id);
+      model.userData.carouselOffset = item.offset;
+      model.userData.drinkId = item.drink.id;
+      return model;
+    })
+  );
+
+  if (switchToken !== modelSwitchToken) {
+    loadedModels.forEach(disposeModel);
+    return;
+  }
+
+  carouselModels = loadedModels;
+  carouselModels.forEach(model => {
+    scene.add(model);
+    if (model.userData.carouselOffset === 0) currentModelGroup = model;
+  });
+  updateCarouselModelTransforms();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -957,51 +1402,17 @@ function animate3D() {
   requestAnimationFrame(animate3D);
   const t = Date.now() * 0.001;
 
-  if (activeLiquidMaterial?.uniforms?.uTime) {
-    activeLiquidMaterial.uniforms.uTime.value = t;
-  }
-  if (activeCupMaterial?.uniforms?.uTime) {
-    activeCupMaterial.uniforms.uTime.value = t;
-  }
-
-  if (activeLiquidMaterial?.uniforms?.uCameraPos) {
-    activeLiquidMaterial.uniforms.uCameraPos.value.copy(camera.position);
-  }
-  if (activeCupMaterial?.uniforms?.uCameraPos) {
-    activeCupMaterial.uniforms.uCameraPos.value.copy(camera.position);
-  }
-
   if (currentModelGroup) {
     if (!rotDragging) {
       rotVelX *= 0.90; rotVelY *= 0.90;
       rotY    += rotVelX * 0.002;
       rotX    += rotVelY * 0.002;
       rotX     = Math.max(-0.7, Math.min(0.7, rotX));
-      currentModelGroup.position.y = -0.40 + Math.sin(t * 1.1) * 0.04;
       
       // Slower rotation
       if (Math.abs(rotVelX) < 0.5) rotY += 0.002; 
     }
-    currentModelGroup.rotation.x = rotX;
-    currentModelGroup.rotation.y = rotY;
-
-    // Handling tactile spring bounce animation
-    let scaleMultiplier = 1.0;
-    if (bounceStartTime) {
-      const elapsed = Date.now() - bounceStartTime;
-      const duration = 300; // Fast short duration
-      if (elapsed < duration) {
-        const progress = elapsed / duration;
-        // Quicker, lighter spring formula
-        scaleMultiplier = 1.0 - Math.exp(-progress * 8) * Math.cos(progress * 25) * 0.08;
-      } else {
-        bounceStartTime = 0; // End animation
-      }
-    }
-    
-    // Apply combined scale
-    const baseScale = currentModelGroup.userData.baseScale || 1.0;
-    currentModelGroup.scale.setScalar(baseScale * scaleMultiplier);
+    updateCarouselModelTransforms(t);
   }
 
   renderer.render(scene, camera);
@@ -1018,8 +1429,17 @@ const resizeObserver = new ResizeObserver(() => {
     camera.aspect = els.canvasContainer.clientWidth / els.canvasContainer.clientHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(els.canvasContainer.clientWidth, els.canvasContainer.clientHeight);
+    updateCarouselModelTransforms();
   }
 });
 resizeObserver.observe(els.canvasContainer);
 
-window.addEventListener('resize', updateUI);
+window.addEventListener('resize', () => {
+  updateUI();
+  fitDrinkName();
+  updateCarouselModelTransforms();
+});
+
+document.fonts?.ready?.then(() => {
+  fitDrinkName();
+});
